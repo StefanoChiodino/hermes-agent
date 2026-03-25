@@ -26,7 +26,7 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_name TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
-    finish_reason TEXT
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_details TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -189,6 +191,24 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
+            if current_version < 6:
+                # v6: add reasoning columns to messages table — preserves assistant
+                # reasoning text and structured reasoning_details across gateway
+                # session turns.  Without these, reasoning chains are lost on
+                # session reload, breaking multi-turn reasoning continuity for
+                # providers that replay reasoning (OpenRouter, OpenAI, Nous).
+                for col_name, col_type in [
+                    ("reasoning", "TEXT"),
+                    ("reasoning_details", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 6")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -587,6 +607,8 @@ class SessionDB:
         tool_call_id: str = None,
         token_count: int = None,
         finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_details: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -595,10 +617,16 @@ class SessionDB:
         if role is 'tool' or tool_calls is present).
         """
         with self._lock:
+            # Serialize reasoning_details (list of dicts) to JSON for storage
+            reasoning_details_json = (
+                json.dumps(reasoning_details)
+                if reasoning_details else None
+            )
             cursor = self._conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   tool_calls, tool_name, timestamp, token_count, finish_reason,
+                   reasoning, reasoning_details)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -609,6 +637,8 @@ class SessionDB:
                     time.time(),
                     token_count,
                     finish_reason,
+                    reasoning,
+                    reasoning_details_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -660,7 +690,8 @@ class SessionDB:
         """
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name "
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "reasoning, reasoning_details "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
@@ -677,6 +708,17 @@ class SessionDB:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            # Restore reasoning fields on assistant messages so providers
+            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
+            # coherent multi-turn reasoning context.
+            if row["role"] == "assistant":
+                if row["reasoning"]:
+                    msg["reasoning"] = row["reasoning"]
+                if row["reasoning_details"]:
+                    try:
+                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             messages.append(msg)
         return messages
 
